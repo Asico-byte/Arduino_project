@@ -1,1 +1,799 @@
 
+/*
+ * ╔══════════════════════════════════════════════════════════╗
+ * ║   PHONE LOCK BOX  –  OLED + Buzzer + Emergency Unlock   ║
+ * ╠══════════════════════════════════════════════════════════╣
+ * ║  Display : Grove 0.96" OLED  (SSD1306, I2C, 128x64)     ║
+ * ║  Added   : Buzzer  +  Emergency Unlock Password          ║
+ * ╠══════════════════════════════════════════════════════════╣
+ * ║  Required libraries (install via Arduino Library Mgr):  ║
+ * ║    Adafruit SSD1306  (by Adafruit)                       ║
+ * ║    Adafruit GFX      (by Adafruit)                       ║
+ * ║    Servo             (built-in)                          ║
+ * ╠══════════════════════════════════════════════════════════╣
+ * ║  Pin map (Uno / Nano):                                   ║
+ * ║    BTN1 = 10   BTN2 = 9    BTN3 = 8                     ║
+ * ║    SERVO = 11  TRIG = 12   ECHO = 13                     ║
+ * ║    BUZZER = A0                                           ║
+ * ║    OLED : SDA = A4   SCL = A5   (hardware I2C)          ║
+ * ╠══════════════════════════════════════════════════════════╣
+ * ║  EMERGENCY PASSWORD  (default: BTN1->BTN1->BTN2->BTN3)  ║
+ * ║    Works from ANY state including while locked.          ║
+ * ║    Each press must come within 5 s of the previous one.  ║
+ * ║    Change EMERG_SEQ[] below to your preferred sequence.  ║
+ * ╚══════════════════════════════════════════════════════════╝
+ */
+
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include <Servo.h>
+
+// ============================================================
+//  HARDWARE CONFIGURATION
+// ============================================================
+#define SCREEN_W   128
+#define SCREEN_H    64
+#define OLED_RESET  -1
+#define OLED_ADDR 0x3C    // Try 0x3D if display stays blank
+
+Adafruit_SSD1306 oled(SCREEN_W, SCREEN_H, &Wire, OLED_RESET);
+Servo srv;
+
+const uint8_t PIN_B1    = 10;
+const uint8_t PIN_B2    =  9;
+const uint8_t PIN_B3    =  8;
+const uint8_t PIN_SERVO = 11;
+const uint8_t PIN_TRIG  = 12;
+const uint8_t PIN_ECHO  = 13;
+const uint8_t PIN_BUZZ  = A0;
+
+// ============================================================
+//  EMERGENCY PASSWORD  <-- CHANGE THIS SEQUENCE
+//  Use 1 = BTN1 / 2 = BTN2 / 3 = BTN3.  Length must be 4.
+// ============================================================
+const uint8_t EMERG_SEQ[4] = { 1, 1, 2, 3 };
+#define EMERG_LEN 4
+
+// ============================================================
+//  TIMING CONSTANTS
+// ============================================================
+const uint32_t STUDY_MS      = 25UL * 60UL * 1000UL;
+const uint32_t OVERRIDE_HOLD = 3000;
+const uint32_t SKIP_HOLD     = 4000;
+const uint32_t DEBOUNCE      =   50;
+const uint32_t ANIM_FRAME    =  400;
+const uint32_t REMOVAL_BUF   = 2000;
+const uint32_t ANGRY_SHOW    = 3000;
+const uint32_t DIST_POLL     =  100;
+const uint32_t BLINK_PERIOD  = 3000;
+const uint32_t BLINK_OPEN_MS =  150;
+const uint32_t EMERG_TIMEOUT = 5000;
+const int      COUNTDOWN_S   =    5;
+
+// ============================================================
+//  DISTANCE THRESHOLDS  (centimetres)
+// ============================================================
+const int DIST_REMOVED = 18;   // phone considered lifted out
+const int DIST_PRESENT =  5;   // phone detected in box
+const int DIST_IDLE    =  8;   // nothing close -> sleep
+
+// ============================================================
+//  FACE LAYOUT
+//  Left panel: x 0-50 | divider: x 51 | Text: x 53-127
+// ============================================================
+#define LX  13   // left eye centre X
+#define LY  22   // left eye centre Y
+#define RX  37   // right eye centre X
+#define RY  22   // right eye centre Y
+#define MX  25   // mouth centre X
+#define MY  44   // mouth centre Y
+#define ER   8   // nominal eye radius
+
+// ============================================================
+//  STATE VARIABLES
+// ============================================================
+bool     locked       = false;
+bool     phoneOut     = true;
+uint32_t lockStart    = 0;
+int32_t  lastDist     = 999;
+uint32_t lastDistPoll = 0;
+
+int  codePwd[3], codeIn[3], codeIdx = 0;
+bool codeActive = false;
+
+// Buttons  (index 0=B1, 1=B2, 2=B3)
+uint32_t bTime[3] = {};
+bool     bDown[3] = {};
+bool     bEdge[3] = {};
+
+// Multi-button combos
+uint32_t overrideStart = 0; bool overrideArmed = false;
+uint32_t skipStart     = 0; bool skipArmed     = false;
+
+// Angry overlay timing
+uint32_t angryStart   = 0; bool angryOn   = false;
+uint32_t angryChStart = 0; bool angryChOn = false;
+
+// Animation / blink
+uint32_t animTick  = 0; uint8_t animFr = 0;
+uint32_t blinkTick = 0;
+
+// Flow flags
+uint32_t lockSeqStart   = 0; bool lockingFlow  = false;
+uint32_t removalStart   = 0; bool removalCheck = false;
+uint32_t unlockCntStart = 0; bool unlockCntOn  = false;
+bool     waitSleep      = false;
+bool     phoneTaken     = false;
+int32_t  minDistCh      = 999;
+
+// Emergency input state
+uint8_t  emergIn[EMERG_LEN] = {};
+uint8_t  emergIdx  = 0;
+uint32_t emergLast = 0;
+
+
+// ============================================================
+//  SOUND HELPERS
+// ============================================================
+void sndLock() {
+  tone(PIN_BUZZ, 800,  80); delay(110);
+  tone(PIN_BUZZ, 450, 180); delay(220);
+}
+void sndUnlock() {
+  tone(PIN_BUZZ,  600,  70); delay(100);
+  tone(PIN_BUZZ,  900,  70); delay(100);
+  tone(PIN_BUZZ, 1200, 180); delay(220);
+}
+void sndAngry() {
+  tone(PIN_BUZZ, 300, 60); delay(80);
+  tone(PIN_BUZZ, 220, 120); delay(160);
+}
+void sndBtn()   { tone(PIN_BUZZ, 1100, 25); }
+void sndTick()  { tone(PIN_BUZZ, 1400, 30); }
+void sndSuccess() {
+  tone(PIN_BUZZ, 1000, 80); delay(90);
+  tone(PIN_BUZZ, 1350, 80); delay(90);
+  tone(PIN_BUZZ, 1700, 200); delay(250);
+}
+void sndEmergency() {
+  for (int i = 0; i < 3; i++) { tone(PIN_BUZZ, 2000, 90); delay(150); }
+  tone(PIN_BUZZ, 2500, 300); delay(350);
+}
+
+
+// ============================================================
+//  OLED DRAWING PRIMITIVES
+// ============================================================
+
+// Vertical separator between face and text panels
+void sep() { oled.drawLine(51, 0, 51, 63, WHITE); }
+
+// Right-panel label (1 or 2 lines of small text)
+void rLabel(const char* l1, const char* l2 = nullptr) {
+  oled.setTextColor(WHITE); oled.setTextSize(1);
+  if (!l2) { oled.setCursor(54, 28); oled.print(l1); }
+  else     { oled.setCursor(54, 18); oled.print(l1);
+             oled.setCursor(54, 34); oled.print(l2); }
+}
+
+// Right-panel countdown: verb label + big digit + dot progress row
+void rCountdown(const char* verb, int rem) {
+  oled.setTextColor(WHITE);
+  oled.setTextSize(1); oled.setCursor(54,  8); oled.print(verb);
+  oled.setTextSize(3); oled.setCursor(70, 22); oled.print(rem);
+  int filled = COUNTDOWN_S - rem;
+  for (int i = 0; i < filled && i < COUNTDOWN_S; i++)
+    oled.fillRect(54 + i * 13, 52, 10, 8, WHITE);
+}
+
+// Blink helper – returns true for BLINK_OPEN_MS every BLINK_PERIOD ms
+bool getBlink(uint32_t t) {
+  if (t - blinkTick < BLINK_OPEN_MS) return true;
+  if (t - blinkTick >= BLINK_PERIOD) blinkTick = t;
+  return false;
+}
+
+// ── Eye primitives ──────────────────────────────────────────
+void eyeOpen(int x, int y, int r = ER) {
+  oled.fillCircle(x, y, r, WHITE);
+  oled.fillCircle(x, y, r / 2 + 1, BLACK);
+  oled.fillCircle(x - 2, y - 2, max(1, r / 4), WHITE);  // glint
+}
+void eyeClose(int x, int y, int r = ER) {
+  oled.drawLine(x - r,     y,     x + r,     y,     WHITE);
+  oled.drawLine(x - r + 1, y + 1, x + r - 1, y + 1, WHITE);
+}
+void eyeHeart(int x, int y) {
+  oled.fillCircle(x - 3, y - 1, 5, WHITE);
+  oled.fillCircle(x + 3, y - 1, 5, WHITE);
+  oled.fillTriangle(x - 7, y + 3, x + 7, y + 3, x, y + 9, WHITE);
+}
+void eyeX(int x, int y, int r = ER) {
+  oled.drawLine(x - r, y - r, x + r, y + r, WHITE);
+  oled.drawLine(x + r, y - r, x - r, y + r, WHITE);
+}
+void eyeAngry(int x, int y, bool left, int r = ER) {
+  oled.fillCircle(x, y, r, WHITE);
+  // Angled eyelid cut
+  if (left) oled.fillTriangle(x - r, y - r, x + r, y - r, x - r, y - 1, BLACK);
+  else      oled.fillTriangle(x - r, y - r, x + r, y - r, x + r, y - 1, BLACK);
+  oled.fillCircle(x, y, r / 2 + 1, BLACK);  // pupil
+  // Angry brow (drawn last so it's on top)
+  if (left) oled.drawLine(x - r, y - r - 3, x + r, y - r + 1, WHITE);
+  else      oled.drawLine(x - r, y - r + 1, x + r, y - r - 3, WHITE);
+}
+void eyeSquint(int x, int y, int r = ER) {
+  oled.fillCircle(x, y, r, WHITE);
+  oled.fillRect(x - r, y - r, r * 2 + 1, r - 1, BLACK);  // cut top half
+  oled.fillCircle(x, y, r / 2, BLACK);
+}
+
+// ── Mouth primitives ────────────────────────────────────────
+void mSmile() {
+  oled.drawCircle(MX, MY - 5, 9, WHITE);
+  oled.fillRect(MX - 10, MY - 14, 20, 9, BLACK);  // mask top arc
+}
+void mFrown() {
+  oled.drawCircle(MX, MY + 6, 9, WHITE);
+  oled.fillRect(MX - 10, MY + 6, 20, 9, BLACK);   // mask bottom arc
+}
+void mFlat() {
+  oled.drawLine(MX - 7, MY, MX + 7, MY, WHITE);
+  oled.drawLine(MX - 7, MY + 1, MX + 7, MY + 1, WHITE);
+}
+void mOval() {
+  oled.drawCircle(MX, MY, 5, WHITE);
+  oled.drawCircle(MX, MY, 4, WHITE);
+}
+void mTiny() { oled.drawLine(MX - 2, MY, MX + 2, MY, WHITE); }
+void mCute() {  // small parabola smile
+  for (int x = -5; x <= 5; x++) {
+    int y = (x * x) / 6;
+    oled.drawPixel(MX + x, MY + y,     WHITE);
+    oled.drawPixel(MX + x, MY + y + 1, WHITE);
+  }
+}
+
+// Blush marks
+void blush() {
+  oled.fillRect(LX - 8, LY + ER,     5, 2, WHITE);
+  oled.fillRect(RX + 3, RY + ER,     5, 2, WHITE);
+}
+
+
+// ============================================================
+//  FACE FUNCTIONS  (each clears display, draws, calls display())
+// ============================================================
+
+void fSleep(uint8_t fr, bool blink) {
+  oled.clearDisplay(); sep();
+  if (blink) {
+    oled.drawLine(LX - ER, LY + 1, LX + ER, LY + 1, WHITE);
+    oled.drawLine(RX - ER, RY + 1, RX + ER, RY + 1, WHITE);
+  } else {
+    for (int d = 0; d < 3; d++) {
+      oled.drawLine(LX - ER + d, LY + d, LX + ER - d, LY + d, WHITE);
+      oled.drawLine(RX - ER + d, RY + d, RX + ER - d, RY + d, WHITE);
+    }
+  }
+  mTiny();
+  oled.setTextColor(WHITE);
+  if (fr >= 1) { oled.setTextSize(1); oled.setCursor(38, 13); oled.print("z"); }
+  if (fr >= 2) { oled.setTextSize(1); oled.setCursor(42,  7); oled.print("z"); }
+  if (fr >= 3) { oled.setTextSize(2); oled.setCursor(44,  0); oled.print("Z"); }
+  rLabel("SLEEPING", "ZZZ...");
+  oled.display();
+}
+
+void fHappy(bool blink, const char* t1, const char* t2 = nullptr) {
+  oled.clearDisplay(); sep();
+  if (blink) { eyeClose(LX, LY); eyeClose(RX, RY); }
+  else       { eyeOpen(LX, LY);  eyeOpen(RX, RY);  }
+  mSmile();
+  rLabel(t1, t2);
+  oled.display();
+}
+
+void fCute(bool blink, const char* t1, const char* t2 = nullptr) {
+  oled.clearDisplay(); sep();
+  int r = ER - 2;
+  if (blink) { eyeClose(LX, LY, r); eyeClose(RX, RY, r); }
+  else {
+    oled.fillCircle(LX, LY, r, WHITE); oled.fillCircle(LX, LY, r/2, BLACK); oled.fillCircle(LX-1,LY-1,1,WHITE);
+    oled.fillCircle(RX, RY, r, WHITE); oled.fillCircle(RX, RY, r/2, BLACK); oled.fillCircle(RX-1,RY-1,1,WHITE);
+  }
+  blush(); mCute();
+  rLabel(t1, t2);
+  oled.display();
+}
+
+// Studying face: focus expression + live timer + progress bar
+void fFocus(bool blink, uint32_t elapsed) {
+  oled.clearDisplay(); sep();
+  if (blink) { eyeClose(LX, LY); eyeClose(RX, RY); }
+  else {
+    eyeOpen(LX, LY); eyeOpen(RX, RY);
+    oled.drawLine(LX - ER, LY - ER - 1, LX + ER, LY - ER + 1, WHITE);  // determined brow
+    oled.drawLine(RX - ER, RY - ER + 1, RX + ER, RY - ER - 1, WHITE);
+  }
+  mFlat();
+  uint32_t rem  = STUDY_MS - elapsed;
+  uint32_t mins = (rem / 1000) / 60;
+  uint32_t secs = (rem / 1000) % 60;
+  oled.setTextColor(WHITE);
+  oled.setTextSize(1); oled.setCursor(54,  8); oled.print("STUDYING");
+  oled.setTextSize(2); oled.setCursor(54, 22);
+  if (mins < 10) oled.print('0'); oled.print(mins);
+  oled.print(':');
+  if (secs < 10) oled.print('0'); oled.print(secs);
+  // Progress bar
+  const int bx = 54, by = 50, bw = 73, bh = 8;
+  oled.drawRect(bx, by, bw, bh, WHITE);
+  int fill = (int)((float)elapsed / STUDY_MS * (bw - 2));
+  if (fill > 0) oled.fillRect(bx + 1, by + 1, fill, bh - 2, WHITE);
+  oled.display();
+}
+
+void fAngry(const char* t1, const char* t2 = nullptr) {
+  oled.clearDisplay(); sep();
+  eyeAngry(LX, LY, true); eyeAngry(RX, RY, false);
+  mFrown();
+  rLabel(t1, t2);
+  oled.display();
+}
+
+void fSuspicious(const char* t1, const char* t2 = nullptr) {
+  oled.clearDisplay(); sep();
+  oled.drawLine(LX - ER, LY - ER - 3, LX + ER, LY - ER + 0, WHITE);
+  oled.drawLine(RX - ER, RY - ER + 0, RX + ER, RY - ER - 3, WHITE);
+  eyeSquint(LX, LY); eyeSquint(RX, RY);
+  mFlat();
+  rLabel(t1, t2);
+  oled.display();
+}
+
+void fSurprised(bool blink, const char* t1, const char* t2 = nullptr) {
+  oled.clearDisplay(); sep();
+  int r = ER + 2;
+  if (blink) { eyeClose(LX, LY, r); eyeClose(RX, RY, r); }
+  else {
+    eyeOpen(LX, LY, r); eyeOpen(RX, RY, r);
+    oled.drawLine(LX - r, LY - r - 2, LX + r, LY - r - 2, WHITE);
+    oled.drawLine(RX - r, RY - r - 2, RX + r, RY - r - 2, WHITE);
+  }
+  mOval();
+  rLabel(t1, t2);
+  oled.display();
+}
+
+void fReward(bool blink, const char* t1, const char* t2 = nullptr) {
+  oled.clearDisplay(); sep();
+  if (blink) { eyeClose(LX, LY); eyeClose(RX, RY); }
+  else       { eyeHeart(LX, LY); eyeHeart(RX, RY); }
+  mSmile();
+  rLabel(t1, t2);
+  oled.display();
+}
+
+void fShy(const char* t1, const char* t2 = nullptr) {
+  oled.clearDisplay(); sep();
+  // UwU diamond eyes
+  oled.drawLine(LX - ER, LY, LX, LY - 4, WHITE); oled.drawLine(LX, LY - 4, LX + ER, LY, WHITE);
+  oled.drawLine(LX - ER, LY, LX, LY + 4, WHITE); oled.drawLine(LX, LY + 4, LX + ER, LY, WHITE);
+  oled.drawLine(RX - ER, RY, RX, RY - 4, WHITE); oled.drawLine(RX, RY - 4, RX + ER, RY, WHITE);
+  oled.drawLine(RX - ER, RY, RX, RY + 4, WHITE); oled.drawLine(RX, RY + 4, RX + ER, RY, WHITE);
+  blush(); mSmile();
+  rLabel(t1, t2);
+  oled.display();
+}
+
+void fDizzy(const char* t1, const char* t2 = nullptr) {
+  oled.clearDisplay(); sep();
+  eyeX(LX, LY); eyeX(RX, RY);
+  for (int x = -8; x <= 8; x++)
+    oled.drawPixel(MX + x, MY + ((abs(x) % 4 < 2) ? 0 : 3), WHITE);
+  rLabel(t1, t2);
+  oled.display();
+}
+
+// Locking countdown: surprised face + right-panel countdown
+void fLockingCountdown(bool blink, int rem) {
+  oled.clearDisplay(); sep();
+  int r = ER + 2;
+  if (blink) { eyeClose(LX, LY, r); eyeClose(RX, RY, r); }
+  else {
+    eyeOpen(LX, LY, r); eyeOpen(RX, RY, r);
+    oled.drawLine(LX - r, LY - r - 2, LX + r, LY - r - 2, WHITE);
+    oled.drawLine(RX - r, RY - r - 2, RX + r, RY - r - 2, WHITE);
+  }
+  mOval();
+  rCountdown("LOCKING IN", rem);
+  oled.display();
+}
+
+// Cute face + right-panel countdown (used for unlock & going-to-sleep)
+void fCuteCountdown(bool blink, const char* verb, int rem) {
+  oled.clearDisplay(); sep();
+  int r = ER - 2;
+  if (blink) { eyeClose(LX, LY, r); eyeClose(RX, RY, r); }
+  else {
+    oled.fillCircle(LX, LY, r, WHITE); oled.fillCircle(LX, LY, r/2, BLACK); oled.fillCircle(LX-1,LY-1,1,WHITE);
+    oled.fillCircle(RX, RY, r, WHITE); oled.fillCircle(RX, RY, r/2, BLACK); oled.fillCircle(RX-1,RY-1,1,WHITE);
+  }
+  blush(); mCute();
+  rCountdown(verb, rem);
+  oled.display();
+}
+
+// Emergency unlock confirmation screen
+void fEmergency() {
+  oled.clearDisplay(); sep();
+  eyeHeart(LX, LY); eyeHeart(RX, RY);
+  mSmile();
+  oled.setTextColor(WHITE); oled.setTextSize(1);
+  oled.setCursor(54,  8); oled.print("EMERGENCY");
+  oled.setCursor(54, 24); oled.print("UNLOCK!");
+  oled.setCursor(54, 40); oled.print("OPENING...");
+  oled.display();
+}
+
+// Password challenge screen
+void fChallenge(int pwd[3], int inputLen, int in[3]) {
+  oled.clearDisplay(); sep();
+  eyeOpen(LX, LY); eyeOpen(RX, RY);
+  mSmile();
+  oled.setTextColor(WHITE); oled.setTextSize(1);
+  oled.setCursor(54,  6); oled.print("ENTER CODE:");
+  oled.setCursor(54, 18);
+  oled.print((char)('0' + pwd[0])); oled.print('-');
+  oled.print((char)('0' + pwd[1])); oled.print('-');
+  oled.print((char)('0' + pwd[2]));
+  oled.setCursor(54, 34); oled.print("YOUR INPUT:");
+  oled.setCursor(54, 46);
+  for (int i = 0; i < 3; i++) {
+    if (i < inputLen) { oled.print((char)('0' + in[i])); oled.print(' '); }
+    else              oled.print("_ ");
+  }
+  oled.setCursor(54, 56); oled.print("1  2  3");
+  oled.display();
+}
+
+
+// ============================================================
+//  RANDOM CHEAT EXPRESSION
+// ============================================================
+void showCheatFace() {
+  sndAngry();
+  switch (random(5)) {
+    case 0: fAngry     ("NOT YET!!",  "FOCUS!");      break;
+    case 1: fSuspicious("HEY!",       "STOP THAT!");  break;
+    case 2: fAngry     ("GO BACK",    "TO WORK!");    break;
+    case 3: fShy       ("SHY...",     "NO CHEAT!");   break;
+    case 4: fDizzy     ("DIZZY...",   "STAY FOCUS");  break;
+  }
+}
+
+
+// ============================================================
+//  SERVO CONTROL
+// ============================================================
+void lockBox() {
+  srv.attach(PIN_SERVO); srv.write(180); delay(1000); srv.detach();
+  locked = true; lockStart = millis();
+  codeActive = false; angryOn = false;
+  sndLock();
+}
+
+void unlockBox() {
+  srv.attach(PIN_SERVO); srv.write(0); delay(1000); srv.detach();
+  locked       = false;
+  phoneOut     = false;   // show "take phone" prompt next loop
+  codeActive   = angryOn = angryChOn = lockingFlow = false;
+  removalCheck = unlockCntOn = waitSleep = false;
+  codeIdx      = 0;
+  animFr       = 0;
+  animTick     = blinkTick = millis();
+  oled.clearDisplay(); oled.display();
+  sndUnlock();
+}
+
+
+// ============================================================
+//  DISTANCE MEASUREMENT
+// ============================================================
+int32_t getDistance() {
+  digitalWrite(PIN_TRIG, LOW);  delayMicroseconds(2);
+  digitalWrite(PIN_TRIG, HIGH); delayMicroseconds(10);
+  digitalWrite(PIN_TRIG, LOW);
+  long dur = pulseIn(PIN_ECHO, HIGH, 25000);  // 25 ms timeout
+  if (dur == 0) return 999;
+  return (int32_t)((dur / 2) / 29.1);
+}
+
+
+// ============================================================
+//  BUTTON HANDLING
+// ============================================================
+void updateButtons() {
+  uint32_t t = millis();
+  const uint8_t pins[3] = { PIN_B1, PIN_B2, PIN_B3 };
+  for (int i = 0; i < 3; i++) {
+    bool s = (digitalRead(pins[i]) == LOW);
+    if (s && !bDown[i] && (t - bTime[i] > DEBOUNCE)) {
+      bDown[i] = true; bEdge[i] = true; bTime[i] = t;
+    } else {
+      bEdge[i] = false;
+      if (!s) bDown[i] = false;
+    }
+  }
+}
+
+
+// ============================================================
+//  EMERGENCY PASSWORD  (global, works in any state)
+// ============================================================
+void checkEmergency(uint8_t btn) {
+  uint32_t t = millis();
+  if (emergIdx > 0 && (t - emergLast) > EMERG_TIMEOUT) emergIdx = 0;
+  emergIn[emergIdx++] = btn;
+  emergLast = t;
+  if (emergIdx == EMERG_LEN) {
+    bool ok = true;
+    for (int i = 0; i < EMERG_LEN; i++)
+      if (emergIn[i] != EMERG_SEQ[i]) { ok = false; break; }
+    emergIdx = 0;
+    if (ok) {
+      sndEmergency();
+      fEmergency();
+      delay(1800);
+      unlockBox();
+    }
+  }
+}
+
+
+// ============================================================
+//  SETUP
+// ============================================================
+void setup() {
+  randomSeed(analogRead(A1));
+  srv.attach(PIN_SERVO);
+  pinMode(PIN_TRIG,  OUTPUT);
+  pinMode(PIN_ECHO,  INPUT);
+  pinMode(PIN_B1,    INPUT_PULLUP);
+  pinMode(PIN_B2,    INPUT_PULLUP);
+  pinMode(PIN_B3,    INPUT_PULLUP);
+  pinMode(PIN_BUZZ,  OUTPUT);
+
+  if (!oled.begin(SSD1306_SWITCHCAPVCC, OLED_ADDR)) {
+    // Display failed: blink built-in LED as error indicator
+    pinMode(LED_BUILTIN, OUTPUT);
+    while (true) { digitalWrite(LED_BUILTIN, !digitalRead(LED_BUILTIN)); delay(300); }
+  }
+  oled.setTextWrap(false);
+  oled.clearDisplay(); oled.display();
+
+  unlockBox();  // start unlocked, servo at 0 deg
+}
+
+
+// ============================================================
+//  MAIN LOOP
+// ============================================================
+void loop() {
+  uint32_t t = millis();
+
+  // 1. Buttons
+  updateButtons();
+
+  // 2. Emergency password check on every button press
+  for (int i = 0; i < 3; i++)
+    if (bEdge[i]) checkEmergency((uint8_t)(i + 1));
+
+  // 3. Distance poll
+  if (t - lastDistPoll >= DIST_POLL) {
+    int32_t d = getDistance();
+    if (d < 200) lastDist = d;
+    lastDistPoll = t;
+  }
+  int32_t dist = lastDist;
+  bool    blink = getBlink(t);
+
+  // 4. Master override: hold B1 + B3 for 3 s -> force unlock
+  if (bDown[0] && bDown[2]) {
+    if (!overrideArmed) { overrideStart = t; overrideArmed = true; }
+    else if (t - overrideStart >= OVERRIDE_HOLD) { unlockBox(); overrideArmed = false; return; }
+  } else overrideArmed = false;
+
+  // 5. Skip timer: hold B2 for 4 s while locked -> jump to challenge
+  if (locked) {
+    if (bDown[1]) {
+      if (!skipArmed) { skipStart = t; skipArmed = true; }
+      else if (t - skipStart >= SKIP_HOLD) {
+        lockStart = t - STUDY_MS; codeActive = false; skipArmed = false;
+        oled.clearDisplay(); oled.display();
+      }
+    } else skipArmed = false;
+  }
+
+  // 6. Phone removal prompt (box just unlocked – phone still inside)
+  if (!phoneOut) {
+    if (dist <= DIST_REMOVED) {
+      showRemovalPrompt(dist, t, blink);
+    } else {
+      // Phone lifted out successfully
+      phoneOut = true; removalCheck = false; unlockCntOn = false;
+    }
+    return;
+  }
+
+  // 7. Idle / sleeping (nothing in box, not locked)
+  if (!locked && dist > DIST_IDLE) {
+    showSleeping(t, blink);
+    return;
+  }
+
+  // 8. Locking sequence: phone placed in box while unlocked
+  if (!locked && dist <= DIST_PRESENT && phoneOut && !waitSleep) {
+    bool canLock = false;
+    if (!phoneTaken) {
+      canLock = true;
+    } else {
+      // After challenge where phone was taken: wait 10 s before re-locking
+      static uint32_t backMs = 0;
+      if (dist <= DIST_PRESENT) {
+        if (backMs == 0) backMs = t;
+        if (t - backMs >= 10000) canLock = true;
+      } else backMs = 0;
+    }
+    if (canLock) {
+      if (!lockingFlow) { lockSeqStart = t; lockingFlow = true; }
+      runLocking(t, blink);
+    }
+    return;
+  }
+
+  // 9. Locked state
+  if (locked) {
+    uint32_t elapsed = t - lockStart;
+
+    if (elapsed < STUDY_MS) {
+      // ── Studying ────────────────────────────────────────
+      if ((bEdge[0] || bEdge[2]) && !skipArmed && !codeActive && !angryOn) {
+        showCheatFace();
+        angryOn = true; angryStart = t;
+      }
+      if (angryOn) {
+        if (t - angryStart >= ANGRY_SHOW) { angryOn = false; oled.clearDisplay(); oled.display(); }
+        return;
+      }
+      fFocus(blink, elapsed);
+
+    } else {
+      // ── Password challenge / reward ──────────────────────
+      handleChallenge(t, dist, blink);
+    }
+  }
+}
+
+
+// ============================================================
+//  STATE SCREEN FUNCTIONS
+// ============================================================
+
+void showSleeping(uint32_t t, bool blink) {
+  if (t - animTick >= ANIM_FRAME) { animFr = (animFr + 1) % 4; animTick = t; }
+  fSleep(animFr, blink);
+}
+
+void showRemovalPrompt(int32_t dist, uint32_t t, bool blink) {
+  // Show "take phone" with cute face
+  fCute((t / 300) % 2, "TAKE PHONE!", "OPEN LID :)");
+
+  if (dist > DIST_REMOVED) {
+    // Phone being lifted – start/continue removal buffer
+    if (!removalCheck) { removalStart = t; removalCheck = true; }
+    else if (t - removalStart >= REMOVAL_BUF) {
+      // Buffer passed – show countdown to completing the removal
+      if (!unlockCntOn) { unlockCntStart = t; unlockCntOn = true; sndTick(); }
+      int rem = (int)(COUNTDOWN_S - (t - unlockCntStart) / 1000);
+      if (rem > 0) {
+        fCuteCountdown(blink, "TAKE PHONE", rem);
+      } else {
+        // Done – phone successfully removed
+        phoneOut = true; removalCheck = false; unlockCntOn = false;
+        codeActive = false; codeIdx = 0;
+        oled.clearDisplay(); oled.display();
+      }
+    }
+  } else {
+    // Phone back in box – reset check
+    removalCheck = false; unlockCntOn = false;
+  }
+}
+
+void runLocking(uint32_t t, bool blink) {
+  int rem = (int)(COUNTDOWN_S - (t - lockSeqStart) / 1000);
+  if (rem > 0) {
+    static int lastRem = COUNTDOWN_S + 1;
+    if (rem != lastRem) { sndTick(); lastRem = rem; }
+    fLockingCountdown(blink, rem);
+  } else {
+    lockBox();
+    lockingFlow = false;
+    phoneTaken  = false;
+  }
+}
+
+void handleChallenge(uint32_t t, int32_t dist, bool blink) {
+  static uint32_t rewardStart = 0;
+
+  // ── Reward animation (3 s) before challenge appears ────
+  if (!codeActive) {
+    fReward(blink, "TIME UP!", "GOOD JOB!");
+    if (rewardStart == 0) { rewardStart = t; minDistCh = dist; sndSuccess(); }
+    if (t - rewardStart < 3000) return;
+    // Generate 3-digit code (each digit 1-3)
+    for (int i = 0; i < 3; i++) codePwd[i] = random(1, 4);
+    codeActive = true; codeIdx = 0;
+    rewardStart = 0; waitSleep = false; angryChOn = false;
+    oled.clearDisplay(); oled.display();
+  }
+
+  // Track minimum distance to detect phone being taken
+  if (dist < minDistCh) minDistCh = dist;
+
+  // ── Phone taken during challenge -> sleep countdown ─────
+  if (!waitSleep && dist > minDistCh + 5 && dist > DIST_REMOVED) {
+    waitSleep = true; phoneTaken = true;
+    unlockCntStart = t; codeActive = false; angryChOn = false;
+    oled.clearDisplay();
+  }
+  if (waitSleep) {
+    int rem = (int)(COUNTDOWN_S - (t - unlockCntStart) / 1000);
+    if (rem > 0) {
+      fCuteCountdown(blink, "GOING SLEEP", rem);
+    } else {
+      waitSleep = false; phoneOut = true;
+      codeActive = false; codeIdx = 0; phoneTaken = true;
+      oled.clearDisplay(); oled.display();
+    }
+    return;
+  }
+
+  // ── Angry overlay: hold for ANGRY_SHOW then clear ───────
+  if (angryChOn) {
+    if (t - angryChStart >= ANGRY_SHOW) { angryChOn = false; oled.clearDisplay(); oled.display(); }
+    return;
+  }
+
+  // ── Show challenge screen ────────────────────────────────
+  fChallenge(codePwd, codeIdx, codeIn);
+
+  // ── Read button input ────────────────────────────────────
+  int b = 0;
+  if (bEdge[0]) b = 1;
+  else if (bEdge[1]) b = 2;
+  else if (bEdge[2]) b = 3;
+
+  if (b > 0 && codeIdx < 3) {
+    sndBtn();
+    if (b != codePwd[codeIdx]) {
+      // Wrong digit – angry face, reset entry
+      showCheatFace();
+      angryChOn = true; angryChStart = t;
+      codeIdx = 0;
+      return;
+    }
+    // Correct digit
+    codeIn[codeIdx++] = b;
+    delay(150);
+    if (codeIdx == 3) {
+      // All 3 correct -> unlock!
+      phoneTaken = true;
+      sndSuccess();
+      unlockBox();
+    }
+  }
+}
